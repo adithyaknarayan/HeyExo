@@ -11,7 +11,14 @@ class ExoskeletonDialogueSystem:
     def __init__(self, model_name: str = "Qwen/Qwen2-VL-7B-Instruct"):
         """Initialize the dialogue system with a Qwen model."""
         self.model_name = model_name
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Check for MPS (Apple Silicon) or CUDA
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+            
         self.baseline_file = Path("baseline_preference.txt")
         self.previous_assistance_file = Path("previous_assistance.txt")
         self.image = None
@@ -30,7 +37,7 @@ class ExoskeletonDialogueSystem:
         print(f"Loading model: {self.model_name}")
         self.model = Qwen2VLForConditionalGeneration.from_pretrained(
             self.model_name,
-            dtype=torch.float16,
+            torch_dtype=torch.float16,
             device_map="auto",
             attn_implementation="sdpa"
         )
@@ -188,6 +195,7 @@ class ExoskeletonDialogueSystem:
 
         # Generate response
         with torch.no_grad():
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             generated_ids = self.model.generate(
                 **inputs, 
                 max_new_tokens=100,
@@ -198,7 +206,7 @@ class ExoskeletonDialogueSystem:
         
         # Decode response
         generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
         ]
         output_text = self.processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
@@ -288,6 +296,7 @@ class ExoskeletonDialogueSystem:
 
         # Generate response
         with torch.no_grad():
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             generated_ids = self.model.generate(
                 **inputs, 
                 max_new_tokens=300,
@@ -298,7 +307,7 @@ class ExoskeletonDialogueSystem:
         
         # Decode response
         generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
         ]
         output_text = self.processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False

@@ -6,29 +6,53 @@ from PIL import Image
 from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
 import sys
 from datetime import datetime
+import os
+import base64
+from io import BytesIO
+
+# Try to import OpenAI and dotenv
+try:
+    from openai import OpenAI
+    from dotenv import load_dotenv
+    load_dotenv()
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
 
 class ExoskeletonDialogueSystem:
     def __init__(self, model_name: str = "Qwen/Qwen2-VL-7B-Instruct"):
-        """Initialize the dialogue system with a Qwen model."""
+        """Initialize the dialogue system with a Qwen model or OpenAI model."""
         self.model_name = model_name
-        # Check for MPS (Apple Silicon) or CUDA
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-            
+        self.is_openai = "gpt-" in model_name.lower()
+        
         self.baseline_file = Path("baseline_preference.txt")
         self.previous_assistance_file = Path("previous_assistance.txt")
         self.image = None
         self.model = None
         self.processor = None
+        self.openai_client = None
         self.baseline_assistance = None
         self.previous_assistance = None
         
-        print(f"Using device: {self.device}")
-        self._load_model()
+        if self.is_openai:
+            if not HAS_OPENAI:
+                raise ImportError("OpenAI package is required for GPT models. Please install it with: pip install openai python-dotenv")
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY environment variable is not set. Please set it in a .env file.")
+            self.openai_client = OpenAI(api_key=api_key)
+            print(f"Initialized OpenAI client with model: {self.model_name}")
+        else:
+            # Check for MPS (Apple Silicon) or CUDA
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+            print(f"Using device: {self.device}")
+            self._load_model()
+            
         self._load_baseline_preference()
         self._load_previous_assistance()
     
@@ -155,6 +179,14 @@ class ExoskeletonDialogueSystem:
         print(f"Image loaded: {image_path}")
         print(f"Image size: {self.image.size}")
     
+    def _encode_image_to_base64(self):
+        """Encode the current PIL image to base64 for OpenAI API."""
+        if self.image is None:
+            return None
+        buffered = BytesIO()
+        self.image.save(buffered, format="JPEG")
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
     def identify_task(self) -> dict:
         """Identify the locomotion task from the image."""
         if self.image is None:
@@ -166,64 +198,96 @@ class ExoskeletonDialogueSystem:
         # Add instruction for JSON output
         prompt = task_prompt + "\n\nYou must respond with ONLY a valid JSON object. No additional text, explanations, or formatting."
         
-        # Prepare messages
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "image": self.image
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
+        if self.is_openai:
+            # OpenAI implementation
+            base64_image = self._encode_image_to_base64()
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_completion_tokens=300,
+                    temperature=0.1
+                )
+                output_text = response.choices[0].message.content
+                # Parse JSON below
+                response_str = output_text.strip()
+            except Exception as e:
+                print(f"OpenAI API Error: {e}")
+                raise e
+        else:
+            # Qwen implementation
+            # Prepare messages
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": self.image
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
 
-        # Process inputs
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs.pop("token_type_ids", None)
-
-        # Generate response
-        with torch.no_grad():
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            generated_ids = self.model.generate(
-                **inputs, 
-                max_new_tokens=100,
-                do_sample=False,  # Use greedy decoding for consistent JSON
-                temperature=0.1,
-                pad_token_id=self.processor.tokenizer.eos_token_id
+            # Process inputs
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
             )
+            inputs.pop("token_type_ids", None)
+
+            # Generate response
+            with torch.no_grad():
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                generated_ids = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=100,
+                    do_sample=False,  # Use greedy decoding for consistent JSON
+                    temperature=0.1,
+                    pad_token_id=self.processor.tokenizer.eos_token_id
+                )
+            
+            # Decode response
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            
+            response_str = output_text[0].strip()
         
-        # Decode response
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
-        ]
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        
-        # Extract and parse JSON
-        response = output_text[0].strip()
+        # Common JSON parsing logic
         
         # Find JSON in response
-        json_start = response.find('{')
+        json_start = response_str.find('{')
         if json_start != -1:
-            response = response[json_start:]
+            response_str = response_str[json_start:]
         
         # Find the end of the JSON object
         brace_count = 0
         json_end = -1
-        for i, char in enumerate(response):
+        for i, char in enumerate(response_str):
             if char == '{':
                 brace_count += 1
             elif char == '}':
@@ -233,7 +297,7 @@ class ExoskeletonDialogueSystem:
                     break
         
         if json_end > 0:
-            json_str = response[:json_end]
+            json_str = response_str[:json_end]
             try:
                 result = json.loads(json_str)
                 # Validate required fields
@@ -243,9 +307,19 @@ class ExoskeletonDialogueSystem:
                     raise ValueError("Missing required fields in task identification JSON")
             except (json.JSONDecodeError, ValueError) as e:
                 print(f"Task identification JSON parsing error: {e}")
-                print(f"Raw response: {response}")
+                print(f"Raw response: {response_str}")
                 raise e
         else:
+            # Try to handle Markdown code blocks if any
+            if "```json" in response_str:
+                try:
+                    code_block = response_str.split("```json")[1].split("```")[0].strip()
+                    result = json.loads(code_block)
+                    if all(key in result for key in ['task', 'terrain_difficulty', 'confidence']):
+                        return result
+                except:
+                    pass
+            
             raise ValueError("No valid JSON found in task identification response")
     
     def analyze_feedback(self, user_feedback: str) -> dict:
@@ -271,60 +345,82 @@ class ExoskeletonDialogueSystem:
         # Add instruction for JSON output
         prompt += "\n\nYou must respond with ONLY a valid JSON object. No additional text, explanations, or formatting."
         
-        # Prepare messages (text-only for assistance adjustment)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
+        if self.is_openai:
+            # OpenAI Implementation for text-only step
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    max_completion_tokens=300,
+                    temperature=0.1
+                )
+                output_text = response.choices[0].message.content
+                response_str = output_text.strip()
+            except Exception as e:
+                print(f"OpenAI API Error: {e}")
+                raise e
+        else:
+            # Qwen Implementation
+            # Prepare messages (text-only for assistance adjustment)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
 
-        # Process inputs
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs.pop("token_type_ids", None)
-
-        # Generate response
-        with torch.no_grad():
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            generated_ids = self.model.generate(
-                **inputs, 
-                max_new_tokens=300,
-                do_sample=False,  # Use greedy decoding for consistent JSON
-                temperature=0.1,
-                pad_token_id=self.processor.tokenizer.eos_token_id
+            # Process inputs
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
             )
+            inputs.pop("token_type_ids", None)
+
+            # Generate response
+            with torch.no_grad():
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                generated_ids = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=300,
+                    do_sample=False,  # Use greedy decoding for consistent JSON
+                    temperature=0.1,
+                    pad_token_id=self.processor.tokenizer.eos_token_id
+                )
+            
+            # Decode response
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
+            ]
+            output_text = self.processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            
+            response_str = output_text[0].strip()
         
-        # Decode response
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], generated_ids)
-        ]
-        output_text = self.processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        
-        # Extract and parse JSON
-        response = output_text[0].strip()
+        # Common JSON parsing logic
         
         # Find JSON in response
-        json_start = response.find('{')
+        json_start = response_str.find('{')
         if json_start != -1:
-            response = response[json_start:]
+            response_str = response_str[json_start:]
         
         # Find the end of the JSON object
         brace_count = 0
         json_end = -1
-        for i, char in enumerate(response):
+        for i, char in enumerate(response_str):
             if char == '{':
                 brace_count += 1
             elif char == '}':
@@ -334,7 +430,7 @@ class ExoskeletonDialogueSystem:
                     break
         
         if json_end > 0:
-            json_str = response[:json_end]
+            json_str = response_str[:json_end]
             try:
                 assist_result = json.loads(json_str)
                 # Validate required fields
@@ -360,9 +456,31 @@ class ExoskeletonDialogueSystem:
                     raise ValueError("Missing required fields in assistance adjustment JSON")
             except (json.JSONDecodeError, ValueError) as e:
                 print(f"Assistance adjustment JSON parsing error: {e}")
-                print(f"Raw response: {response}")
+                print(f"Raw response: {response_str}")
                 raise e
         else:
+             # Try to handle Markdown code blocks if any
+            if "```json" in response_str:
+                try:
+                    code_block = response_str.split("```json")[1].split("```")[0].strip()
+                    assist_result = json.loads(code_block)
+                    if all(key in assist_result for key in ['initial_assistance', 'assistance_delta', 'reasoning']):
+                        delta = float(assist_result['assistance_delta'])
+                        final_assistance = self.previous_assistance + delta
+                        final_assistance = max(0.0, min(20.0, final_assistance))
+                        result = {
+                            'task': task_result['task'],
+                            'terrain_difficulty': task_result['terrain_difficulty'],
+                            'confidence': task_result['confidence'],
+                            'initial_assistance': assist_result['initial_assistance'],
+                            'assistance_delta': assist_result['assistance_delta'],
+                            'reasoning': assist_result['reasoning'],
+                            'final_assistance_level': final_assistance
+                        }
+                        return result
+                except:
+                    pass
+
             raise ValueError("No valid JSON found in assistance adjustment response")
     
     def run_dialogue(self):
@@ -430,7 +548,7 @@ def main():
     parser = argparse.ArgumentParser(description="Exoskeleton Dialogue System")
     parser.add_argument("--image", "-i", required=True, help="Path to the input image")
     parser.add_argument("--model", "-m", default="Qwen/Qwen2-VL-7B-Instruct", 
-                       help="Qwen model name (default: Qwen/Qwen2-VL-7B-Instruct)")
+                       help="Qwen model name (default: Qwen/Qwen2-VL-7B-Instruct) or OpenAI model (e.g. gpt-4o)")
     
     args = parser.parse_args()
     

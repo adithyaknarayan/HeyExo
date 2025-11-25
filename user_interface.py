@@ -44,9 +44,18 @@ def main():
         model_options = [
             "Qwen/Qwen2-VL-2B-Instruct",
             "Qwen/Qwen2-VL-7B-Instruct",
+            "gpt-5.1-2025-11-13",
+            "gpt-5-2025-08-07",
+            "gpt-5-nano-2025-08-07",
+            "gpt-5-mini-2025-08-07",
+            "gpt-4.1-2025-04-14",
         ]
         model_name = st.selectbox("Model Name", options=model_options, index=0)
-        st.caption("Note: The 2B model is faster. Use 7B for better accuracy if you have a powerful GPU.")
+        
+        if "gpt" in model_name:
+             st.caption("Note: Using OpenAI models requires OPENAI_API_KEY in .env file.")
+        else:
+             st.caption("Note: The 2B model is faster. Use 7B for better accuracy if you have a powerful GPU.")
         
         # Image Selection
         st.subheader("Input Image")

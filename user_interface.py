@@ -41,7 +41,11 @@ def main():
     with st.sidebar:
         st.header("Configuration")
         # Default to 2B model for faster inference on local machines
-        model_name = st.text_input("Model Name", value="Qwen/Qwen2-VL-2B-Instruct")
+        model_options = [
+            "Qwen/Qwen2-VL-2B-Instruct",
+            "Qwen/Qwen2-VL-7B-Instruct",
+        ]
+        model_name = st.selectbox("Model Name", options=model_options, index=0)
         st.caption("Note: The 2B model is faster. Use 7B for better accuracy if you have a powerful GPU.")
         
         # Image Selection
@@ -141,7 +145,7 @@ def main():
                     st.write(result)
 
     # Chat Input
-    if prompt := st.chat_input("How does the assistance feel?"):
+    if prompt := st.chat_input("How does the assistance feel? / what do you need?"):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):

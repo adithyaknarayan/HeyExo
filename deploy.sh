@@ -28,12 +28,15 @@ if [ ! -d "data" ]; then
 fi
 
 echo "✅ Deployment checks passed!"
-echo "To deploy this application:"
-echo "1. Ensure python 3.9+ is installed on the target server"
-echo "2. Copy all files to the server"
-echo "3. Run ./install.sh on the server"
-echo "4. Run ./run.sh to start the application"
-echo ""
-echo "For Docker deployment (optional):"
-echo "A Dockerfile can be created to containerize this application."
+echo "🚀 Starting deployment process..."
 
+# Ensure scripts are executable
+chmod +x install.sh run.sh
+
+# Run installation
+echo "📝 Running installation script..."
+./install.sh
+
+# Run application
+echo "🏃 Starting application..."
+./run.sh

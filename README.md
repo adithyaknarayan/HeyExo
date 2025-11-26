@@ -22,6 +22,11 @@ The project includes convenient scripts for installation and execution.
 
 ### Quick Start
 
+> **Mac / Linux users:** make sure the helper scripts are executable **before** running them:
+> ```bash
+> chmod +x install.sh run.sh deploy.sh
+> ```
+
 1.  **Install Dependencies**
     ```bash
     ./install.sh

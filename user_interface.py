@@ -4,6 +4,15 @@ from pathlib import Path
 from PIL import Image
 import torch
 from dialogue_system import ExoskeletonDialogueSystem
+# New import for speech functionality
+from speech_pipeline import SpeechPipeline
+
+# Optional voice recorder component
+try:
+    from audio_recorder_streamlit import audio_recorder
+    HAS_AUDIO_RECORDER = True
+except ImportError:
+    HAS_AUDIO_RECORDER = False
 
 # Set page config
 st.set_page_config(
@@ -17,6 +26,16 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "system" not in st.session_state:
     st.session_state.system = None
+if "speech_pipeline" not in st.session_state:
+    try:
+        st.session_state.speech_pipeline = SpeechPipeline()
+    except Exception as e:
+        print(f"Speech pipeline initialization failed (likely missing API key): {e}")
+        st.session_state.speech_pipeline = None
+
+# Helper to capture audio input into the prompt
+if "transcribed_text" not in st.session_state:
+    st.session_state.transcribed_text = ""
 
 def save_baseline(value):
     with open("baseline_preference.txt", "w") as f:
@@ -35,7 +54,7 @@ def load_system(model_name):
     return ExoskeletonDialogueSystem(model_name)
 
 def main():
-    st.title("🦿 Exoskeleton Dialogue Interface")
+    st.title("🦿 HeyExo!")
     
     # Sidebar for configuration
     with st.sidebar:
@@ -62,7 +81,7 @@ def main():
         uploaded_file = st.file_uploader("Upload an image", type=["jpg", "png", "jpeg", "webp"])
         
         # Sample images
-        data_dir = Path("data")
+        data_dir = Path("data/image")
         if data_dir.exists():
             sample_images = list(data_dir.glob("*"))
             if sample_images:
@@ -153,22 +172,115 @@ def main():
                 else:
                     st.write(result)
 
-    # Chat Input
-    if prompt := st.chat_input("How does the assistance feel? / what do you need?"):
+    # Chat Input Area with Microphone
+    
+    st.divider()
+    
+    # Sound Selection Section
+    st.subheader("🔊 Audio Input")
+    st.markdown(
+        "You can:\n"
+        "1. **Record** a new voice message\n"
+        "2. **Upload / capture** audio from your browser\n"
+        "3. **Choose** a pre-recorded sample from the list"
+    )
+    
+    col_audio_1, col_audio_2 = st.columns([1, 1])
+    
+    selected_audio_path = None
+    
+    with col_audio_1:
+        audio_value = None
+        recorded_bytes = None
+
+        # 1) Record button (if component available)
+        if HAS_AUDIO_RECORDER:
+            st.markdown("**(1) Record voice**")
+            recorded_bytes = audio_recorder(
+                text="Click to start / stop recording",
+                recording_color="#e74c3c",
+                neutral_color="#95a5a6",
+                icon_name="microphone",
+                icon_size="2x",
+            )
+
+        # 2) Native audio input (newer Streamlit) or fallback uploader
+        st.markdown("**(2) Or upload / capture audio**")
+        if hasattr(st, "audio_input"):
+            audio_value = st.audio_input("Record or upload voice feedback")
+        else:
+            audio_value = st.file_uploader("Upload voice feedback", type=["wav", "mp3", "m4a"], key="voice_upload")
+    
+    with col_audio_2:
+        # Sample Sounds Selection
+        sound_dir = Path("data/sound")
+        sample_sounds = []
+        if sound_dir.exists():
+            sample_sounds = list(sound_dir.glob("*.mp3")) + list(sound_dir.glob("*.wav"))
+        
+        selected_sound_name = st.selectbox(
+            "(3) Or choose a pre-recorded sample", 
+            ["None"] + [p.name for p in sample_sounds]
+        )
+        
+        if selected_sound_name != "None":
+            selected_audio_path = sound_dir / selected_sound_name
+            st.audio(str(selected_audio_path), format="audio/mp3")
+
+    # Determine which audio to process
+    audio_to_process = None
+    
+    # Priority: Live recorded > audio_input/uploaded > selected sample
+    if recorded_bytes:
+        audio_to_process = recorded_bytes
+    elif audio_value:
+        # audio_input gives a BytesIO-like object, uploader gives UploadedFile
+        audio_to_process = audio_value.read()
+    elif selected_audio_path:
+        if st.button("Process Selected Audio"):
+            with open(selected_audio_path, "rb") as f:
+                audio_to_process = f.read()
+
+    if audio_to_process:
+        if st.session_state.speech_pipeline:
+            with st.spinner("Transcribing voice..."):
+                try:
+                    # process_streamlit_audio handles bytes
+                    transcription = st.session_state.speech_pipeline.process_streamlit_audio(audio_to_process)
+                    if transcription:
+                        st.session_state.transcribed_text = transcription
+                        st.info(f"Transcribed: {transcription}")
+                except Exception as e:
+                    st.error(f"Speech processing error: {e}")
+
+    # Use the transcribed text if available, or just let user type
+    st.subheader("✍️ **Text Input**")
+    st.markdown("**You can also type your instruction below:**")
+    prompt = st.chat_input("How does the assistance feel? / what do you need?")
+    
+    # Determine the final prompt to use
+    final_prompt = None
+    if prompt:
+        final_prompt = prompt
+        st.session_state.transcribed_text = "" # Clear after use
+    elif st.session_state.transcribed_text:
+        # If we have transcribed text but no manual input yet, we can offer a button to send it
+        if st.button(f"Send Voice Command: '{st.session_state.transcribed_text}'"):
+            final_prompt = st.session_state.transcribed_text
+            st.session_state.transcribed_text = ""
+
+    if final_prompt:
         # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state.messages.append({"role": "user", "content": final_prompt})
         with st.chat_message("user"):
-            st.write(prompt)
+            st.write(final_prompt)
 
         # Generate response
         with st.chat_message("assistant"):
             with st.spinner("Analyzing environment and feedback..."):
                 try:
-                    # Run the heavy computation in a way that doesn't block UI updates if possible, 
-                    # but here we just need to make sure we catch everything.
-                    # Explicitly convert prompt to string just in case
-                    user_prompt = str(prompt)
-                    
+                    # Run the heavy computation
+                    user_prompt = str(final_prompt)
                     result = st.session_state.system.analyze_feedback(user_prompt)
                     
                     # Update system state (save previous assistance)
@@ -195,4 +307,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

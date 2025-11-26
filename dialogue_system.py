@@ -24,7 +24,8 @@ class ExoskeletonDialogueSystem:
     def __init__(self, model_name: str = "Qwen/Qwen2-VL-7B-Instruct"):
         """Initialize the dialogue system with a Qwen model or OpenAI model."""
         self.model_name = model_name
-        self.is_openai = "gpt-" in model_name.lower() or "o1-" in model_name.lower()
+        # Treat any "gpt-" model name as an OpenAI model
+        self.is_openai = "gpt-" in model_name.lower()
         
         self.baseline_file = Path("baseline_preference.txt")
         self.previous_assistance_file = Path("previous_assistance.txt")
@@ -32,11 +33,9 @@ class ExoskeletonDialogueSystem:
         self.model = None
         self.processor = None
         self.openai_client = None
-        
-        # Determine feature support based on model name
-        is_o1 = "o1-" in model_name.lower()
-        self.openai_supports_temperature = not is_o1
-        self.openai_supports_response_format = not is_o1
+        # Assume support for temperature / response_format; fall back dynamically on API errors
+        self.openai_supports_temperature = True
+        self.openai_supports_response_format = True
         
         self.baseline_assistance = None
         self.previous_assistance = None
@@ -197,7 +196,14 @@ class ExoskeletonDialogueSystem:
     def _message_content_to_text(self, content) -> str:
         """Convert OpenAI message content (string, list, or SDK object) to plain text."""
         if content is None:
+            print("WARNING: OpenAI message content is None!")
             return ""
+        
+        # Debugging: Print raw content type if it's not a simple string
+        if not isinstance(content, str):
+            # Try to print a representation without dumping huge objects
+            print(f"DEBUG: Processing complex message content of type {type(content)}")
+
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -209,6 +215,8 @@ class ExoskeletonDialogueSystem:
                     parts.append(item.text)
                 elif isinstance(item, dict) and "text" in item:
                     parts.append(item.get("text") or "")
+                elif isinstance(item, dict) and "type" in item and item["type"] == "text":
+                     parts.append(item.get("text") or "")
                 else:
                     parts.append(str(item))
             return "".join(parts)
@@ -217,8 +225,8 @@ class ExoskeletonDialogueSystem:
     def _create_openai_chat_completion(
         self,
         messages,
-        max_completion_tokens=300,
-        temperature=0.1,
+        max_completion_tokens=2000,
+        temperature=1,
         response_format=None,
         **extra_kwargs
     ):
@@ -331,7 +339,12 @@ class ExoskeletonDialogueSystem:
 
         # If we reach here, extraction failed
         print(f"FAILED TO EXTRACT JSON FROM: {response_str!r}")
-        raise ValueError("No valid JSON found in response")
+        
+        # If response was empty, it might be due to filtered content
+        if not response_str:
+             print("WARNING: Response string is empty!")
+             
+        raise ValueError(f"No valid JSON found in response. Raw response: {response_str[:200]}...")
 
     def identify_task(self) -> dict:
         """Identify the locomotion task from the image."""
@@ -341,8 +354,16 @@ class ExoskeletonDialogueSystem:
         # Load the task identification prompt
         task_prompt = self._load_task_prompt()
         
-        # Add instruction for JSON output
-        prompt = task_prompt + "\n\nYou must respond with ONLY a valid JSON object. No additional text, explanations, or formatting."
+        # Add instruction for JSON output with explicit schema
+        prompt = task_prompt + """
+
+IMPORTANT: You must respond with ONLY a valid JSON object matching this exact schema:
+{
+  "task": "<one of: uphill, downhill, run, stairs_up, stairs_down, flat>",
+  "terrain_difficulty": "<one of: gentle, moderate, steep>",
+  "confidence": <float between 0.0 and 1.0>
+}
+Do not include any Markdown formatting (no ```json ... ```), just the raw JSON string."""
         
         if self.is_openai:
             # OpenAI implementation
@@ -363,16 +384,23 @@ class ExoskeletonDialogueSystem:
                             ]
                         }
                     ],
-                    max_completion_tokens=300,
-                    temperature=0.1,
+                    max_completion_tokens=2000,
+                    temperature=1,
                     response_format={"type": "json_object"}
                 )
                 message = response.choices[0].message
-                parsed_payload = getattr(message, "parsed", None)
-                if parsed_payload:
-                    return parsed_payload # If already parsed, return it directly
-                
-                response_str = self._message_content_to_text(message.content).strip()
+                # Try direct JSON parse first (JSON mode guarantees valid JSON in content)
+                raw_content = self._message_content_to_text(message.content).strip()
+                try:
+                    result = json.loads(raw_content)
+                    # Validate required fields early
+                    if all(key in result for key in ['task', 'terrain_difficulty', 'confidence']):
+                        return result
+                    # If structure is wrong, fall through to robust extractor
+                except Exception:
+                    pass
+                # Fallback: let robust extractor try to salvage JSON from the raw content
+                response_str = raw_content
             except Exception as e:
                 print(f"OpenAI API Error: {e}")
                 raise e
@@ -412,7 +440,7 @@ class ExoskeletonDialogueSystem:
                     **inputs, 
                     max_new_tokens=100,
                     do_sample=False,  # Use greedy decoding for consistent JSON
-                    temperature=0.1,
+                    temperature=1,
                     pad_token_id=self.processor.tokenizer.eos_token_id
                 )
             
@@ -455,8 +483,16 @@ class ExoskeletonDialogueSystem:
         prompt = prompt.replace("{PREVIOUS_ASSISTANCE}", str(self.previous_assistance))
         prompt = prompt.replace("{USER_FEEDBACK}", user_feedback)
         
-        # Add instruction for JSON output
-        prompt += "\n\nYou must respond with ONLY a valid JSON object. No additional text, explanations, or formatting."
+        # Add instruction for JSON output with explicit schema
+        prompt += """
+
+IMPORTANT: You must respond with ONLY a valid JSON object matching this exact schema:
+{
+  "initial_assistance": <float>,
+  "assistance_delta": <float>,
+  "reasoning": "<string>"
+}
+Do not include any Markdown formatting (no ```json ... ```), just the raw JSON string."""
         
         if self.is_openai:
             # OpenAI Implementation for text-only step
@@ -468,18 +504,18 @@ class ExoskeletonDialogueSystem:
                             "content": prompt
                         }
                     ],
-                    max_completion_tokens=300,
-                    temperature=0.1,
+                    max_completion_tokens=2000,
+                    temperature=1,
                     response_format={"type": "json_object"}
                 )
                 message = response.choices[0].message
-                parsed_payload = getattr(message, "parsed", None)
-                if parsed_payload:
-                    assist_result = parsed_payload
-                    response_str = None # Signal that we have the result
-                else:
-                    response_str = self._message_content_to_text(message.content).strip()
+                # Try direct JSON parse first
+                raw_content = self._message_content_to_text(message.content).strip()
+                try:
+                    assist_result = json.loads(raw_content)
+                except Exception:
                     assist_result = None
+                    response_str = raw_content
             except Exception as e:
                 print(f"OpenAI API Error: {e}")
                 raise e
@@ -515,7 +551,7 @@ class ExoskeletonDialogueSystem:
                     **inputs, 
                     max_new_tokens=300,
                     do_sample=False,  # Use greedy decoding for consistent JSON
-                    temperature=0.1,
+                    temperature=1,
                     pad_token_id=self.processor.tokenizer.eos_token_id
                 )
             

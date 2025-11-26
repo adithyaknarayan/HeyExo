@@ -9,6 +9,7 @@ from datetime import datetime
 import os
 import base64
 from io import BytesIO
+import re
 
 # Try to import OpenAI and dotenv
 try:
@@ -23,7 +24,7 @@ class ExoskeletonDialogueSystem:
     def __init__(self, model_name: str = "Qwen/Qwen2-VL-7B-Instruct"):
         """Initialize the dialogue system with a Qwen model or OpenAI model."""
         self.model_name = model_name
-        self.is_openai = "gpt-" in model_name.lower()
+        self.is_openai = "gpt-" in model_name.lower() or "o1-" in model_name.lower()
         
         self.baseline_file = Path("baseline_preference.txt")
         self.previous_assistance_file = Path("previous_assistance.txt")
@@ -31,6 +32,12 @@ class ExoskeletonDialogueSystem:
         self.model = None
         self.processor = None
         self.openai_client = None
+        
+        # Determine feature support based on model name
+        is_o1 = "o1-" in model_name.lower()
+        self.openai_supports_temperature = not is_o1
+        self.openai_supports_response_format = not is_o1
+        
         self.baseline_assistance = None
         self.previous_assistance = None
         
@@ -187,6 +194,145 @@ class ExoskeletonDialogueSystem:
         self.image.save(buffered, format="JPEG")
         return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
+    def _message_content_to_text(self, content) -> str:
+        """Convert OpenAI message content (string, list, or SDK object) to plain text."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if item is None:
+                    continue
+                if hasattr(item, "text"):
+                    parts.append(item.text)
+                elif isinstance(item, dict) and "text" in item:
+                    parts.append(item.get("text") or "")
+                else:
+                    parts.append(str(item))
+            return "".join(parts)
+        return str(content)
+
+    def _create_openai_chat_completion(
+        self,
+        messages,
+        max_completion_tokens=300,
+        temperature=0.1,
+        response_format=None,
+        **extra_kwargs
+    ):
+        """
+        Create an OpenAI chat completion, falling back to the default temperature when the
+        selected model rejects custom temperature values.
+        """
+        if not self.openai_client:
+            raise RuntimeError("OpenAI client is not initialized.")
+
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_completion_tokens": max_completion_tokens,
+            **extra_kwargs
+        }
+
+        include_temperature = temperature is not None and self.openai_supports_temperature
+        include_response_format = response_format is not None and self.openai_supports_response_format
+        if include_temperature:
+            payload["temperature"] = temperature
+        if include_response_format:
+            payload["response_format"] = response_format
+
+        while True:
+            try:
+                return self.openai_client.chat.completions.create(**payload)
+            except Exception as e:
+                error_message = getattr(e, "message", str(e))
+                retry = False
+
+                if include_temperature and "temperature" in error_message and "unsupported" in error_message:
+                    print("Temperature not supported by this OpenAI model, retrying with default temperature.")
+                    self.openai_supports_temperature = False
+                    include_temperature = False
+                    payload.pop("temperature", None)
+                    retry = True
+
+                if include_response_format and "response_format" in error_message and "unsupported" in error_message:
+                    print("Response format not supported by this OpenAI model, retrying without it.")
+                    self.openai_supports_response_format = False
+                    include_response_format = False
+                    payload.pop("response_format", None)
+                    retry = True
+
+                if retry:
+                    continue
+                raise
+
+    def _extract_json_from_response(self, response_str: str) -> dict:
+        """
+        Extract and parse JSON from a response string using multiple strategies.
+        This handles clean JSON, Markdown code blocks, and embedded JSON.
+        """
+        response_str = response_str.strip()
+        
+        # Strategy 1: Attempt to parse the raw response directly
+        try:
+            return json.loads(response_str)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 2: Extract from Markdown code blocks (```json ... ```)
+        json_code_block = re.search(r"```(?:json)?\s*(.*?)\s*```", response_str, re.DOTALL)
+        if json_code_block:
+            try:
+                return json.loads(json_code_block.group(1))
+            except json.JSONDecodeError:
+                pass
+        
+        # Strategy 3: Find the largest substring between { and } that forms valid JSON
+        # This handles cases where there's text before/after the JSON
+        try:
+            start_indices = [i for i, char in enumerate(response_str) if char == '{']
+            end_indices = [i for i, char in enumerate(response_str) if char == '}']
+            
+            # Try to match every starting { with every subsequent ending }
+            # Iterate from largest range to smallest to find the main object
+            for start in start_indices:
+                for end in reversed(end_indices):
+                    if end > start:
+                        possible_json = response_str[start : end + 1]
+                        try:
+                            return json.loads(possible_json)
+                        except json.JSONDecodeError:
+                            continue
+        except Exception:
+            pass
+            
+        # Strategy 4: If all else fails, use a fallback brace counter (legacy support)
+        # This is similar to what was there before but wrapped as a last resort
+        json_start = response_str.find('{')
+        if json_start != -1:
+            snippet = response_str[json_start:]
+            brace_count = 0
+            json_end = -1
+            for i, char in enumerate(snippet):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+            if json_end > 0:
+                try:
+                    return json.loads(snippet[:json_end])
+                except json.JSONDecodeError:
+                    pass
+
+        # If we reach here, extraction failed
+        print(f"FAILED TO EXTRACT JSON FROM: {response_str!r}")
+        raise ValueError("No valid JSON found in response")
+
     def identify_task(self) -> dict:
         """Identify the locomotion task from the image."""
         if self.image is None:
@@ -202,8 +348,7 @@ class ExoskeletonDialogueSystem:
             # OpenAI implementation
             base64_image = self._encode_image_to_base64()
             try:
-                response = self.openai_client.chat.completions.create(
-                    model=self.model_name,
+                response = self._create_openai_chat_completion(
                     messages=[
                         {
                             "role": "user",
@@ -219,11 +364,15 @@ class ExoskeletonDialogueSystem:
                         }
                     ],
                     max_completion_tokens=300,
-                    temperature=0.1
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
                 )
-                output_text = response.choices[0].message.content
-                # Parse JSON below
-                response_str = output_text.strip()
+                message = response.choices[0].message
+                parsed_payload = getattr(message, "parsed", None)
+                if parsed_payload:
+                    return parsed_payload # If already parsed, return it directly
+                
+                response_str = self._message_content_to_text(message.content).strip()
             except Exception as e:
                 print(f"OpenAI API Error: {e}")
                 raise e
@@ -277,50 +426,14 @@ class ExoskeletonDialogueSystem:
             
             response_str = output_text[0].strip()
         
-        # Common JSON parsing logic
+        # Use robust extraction
+        result = self._extract_json_from_response(response_str)
         
-        # Find JSON in response
-        json_start = response_str.find('{')
-        if json_start != -1:
-            response_str = response_str[json_start:]
-        
-        # Find the end of the JSON object
-        brace_count = 0
-        json_end = -1
-        for i, char in enumerate(response_str):
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    json_end = i + 1
-                    break
-        
-        if json_end > 0:
-            json_str = response_str[:json_end]
-            try:
-                result = json.loads(json_str)
-                # Validate required fields
-                if all(key in result for key in ['task', 'terrain_difficulty', 'confidence']):
-                    return result
-                else:
-                    raise ValueError("Missing required fields in task identification JSON")
-            except (json.JSONDecodeError, ValueError) as e:
-                print(f"Task identification JSON parsing error: {e}")
-                print(f"Raw response: {response_str}")
-                raise e
+        # Validate required fields
+        if all(key in result for key in ['task', 'terrain_difficulty', 'confidence']):
+            return result
         else:
-            # Try to handle Markdown code blocks if any
-            if "```json" in response_str:
-                try:
-                    code_block = response_str.split("```json")[1].split("```")[0].strip()
-                    result = json.loads(code_block)
-                    if all(key in result for key in ['task', 'terrain_difficulty', 'confidence']):
-                        return result
-                except:
-                    pass
-            
-            raise ValueError("No valid JSON found in task identification response")
+            raise ValueError(f"Missing required fields in task identification JSON: {result}")
     
     def analyze_feedback(self, user_feedback: str) -> dict:
         """Analyze user feedback using two-part system: task identification + assistance adjustment."""
@@ -348,8 +461,7 @@ class ExoskeletonDialogueSystem:
         if self.is_openai:
             # OpenAI Implementation for text-only step
             try:
-                response = self.openai_client.chat.completions.create(
-                    model=self.model_name,
+                response = self._create_openai_chat_completion(
                     messages=[
                         {
                             "role": "user",
@@ -357,10 +469,17 @@ class ExoskeletonDialogueSystem:
                         }
                     ],
                     max_completion_tokens=300,
-                    temperature=0.1
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
                 )
-                output_text = response.choices[0].message.content
-                response_str = output_text.strip()
+                message = response.choices[0].message
+                parsed_payload = getattr(message, "parsed", None)
+                if parsed_payload:
+                    assist_result = parsed_payload
+                    response_str = None # Signal that we have the result
+                else:
+                    response_str = self._message_content_to_text(message.content).strip()
+                    assist_result = None
             except Exception as e:
                 print(f"OpenAI API Error: {e}")
                 raise e
@@ -409,79 +528,33 @@ class ExoskeletonDialogueSystem:
             )
             
             response_str = output_text[0].strip()
+            assist_result = None
         
-        # Common JSON parsing logic
-        
-        # Find JSON in response
-        json_start = response_str.find('{')
-        if json_start != -1:
-            response_str = response_str[json_start:]
-        
-        # Find the end of the JSON object
-        brace_count = 0
-        json_end = -1
-        for i, char in enumerate(response_str):
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    json_end = i + 1
-                    break
-        
-        if json_end > 0:
-            json_str = response_str[:json_end]
-            try:
-                assist_result = json.loads(json_str)
-                # Validate required fields
-                if all(key in assist_result for key in ['initial_assistance', 'assistance_delta', 'reasoning']):
-                    # Calculate final assistance level by adding delta to previous assistance
-                    delta = float(assist_result['assistance_delta'])
-                    final_assistance = self.previous_assistance + delta
-                    # Ensure final assistance level is within bounds
-                    final_assistance = max(0.0, min(20.0, final_assistance))
-                    
-                    # Combine task identification and assistance adjustment results
-                    result = {
-                        'task': task_result['task'],
-                        'terrain_difficulty': task_result['terrain_difficulty'],
-                        'confidence': task_result['confidence'],
-                        'initial_assistance': assist_result['initial_assistance'],
-                        'assistance_delta': assist_result['assistance_delta'],
-                        'reasoning': assist_result['reasoning'],
-                        'final_assistance_level': final_assistance
-                    }
-                    return result
-                else:
-                    raise ValueError("Missing required fields in assistance adjustment JSON")
-            except (json.JSONDecodeError, ValueError) as e:
-                print(f"Assistance adjustment JSON parsing error: {e}")
-                print(f"Raw response: {response_str}")
-                raise e
-        else:
-             # Try to handle Markdown code blocks if any
-            if "```json" in response_str:
-                try:
-                    code_block = response_str.split("```json")[1].split("```")[0].strip()
-                    assist_result = json.loads(code_block)
-                    if all(key in assist_result for key in ['initial_assistance', 'assistance_delta', 'reasoning']):
-                        delta = float(assist_result['assistance_delta'])
-                        final_assistance = self.previous_assistance + delta
-                        final_assistance = max(0.0, min(20.0, final_assistance))
-                        result = {
-                            'task': task_result['task'],
-                            'terrain_difficulty': task_result['terrain_difficulty'],
-                            'confidence': task_result['confidence'],
-                            'initial_assistance': assist_result['initial_assistance'],
-                            'assistance_delta': assist_result['assistance_delta'],
-                            'reasoning': assist_result['reasoning'],
-                            'final_assistance_level': final_assistance
-                        }
-                        return result
-                except:
-                    pass
+        # Use robust extraction if not already parsed
+        if assist_result is None:
+            assist_result = self._extract_json_from_response(response_str)
 
-            raise ValueError("No valid JSON found in assistance adjustment response")
+        # Validate required fields
+        if all(key in assist_result for key in ['initial_assistance', 'assistance_delta', 'reasoning']):
+            # Calculate final assistance level by adding delta to previous assistance
+            delta = float(assist_result['assistance_delta'])
+            final_assistance = self.previous_assistance + delta
+            # Ensure final assistance level is within bounds
+            final_assistance = max(0.0, min(20.0, final_assistance))
+            
+            # Combine task identification and assistance adjustment results
+            result = {
+                'task': task_result['task'],
+                'terrain_difficulty': task_result['terrain_difficulty'],
+                'confidence': task_result['confidence'],
+                'initial_assistance': assist_result['initial_assistance'],
+                'assistance_delta': assist_result['assistance_delta'],
+                'reasoning': assist_result['reasoning'],
+                'final_assistance_level': final_assistance
+            }
+            return result
+        else:
+            raise ValueError(f"Missing required fields in assistance adjustment JSON: {assist_result}")
     
     def run_dialogue(self):
         """Run the interactive dialogue system."""

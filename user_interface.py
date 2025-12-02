@@ -54,7 +54,11 @@ def load_system(model_name):
     return ExoskeletonDialogueSystem(model_name)
 
 def main():
-    st.title("🦿 HeyExo!")
+    # App header with SVG logo (use Streamlit's image loader so path is resolved correctly)
+    try:
+        st.image("svg_logo_white.svg", width=170)
+    except Exception:
+        st.title("HeyExo")
     
     # Sidebar for configuration
     with st.sidebar:
